@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly refresh of China IPv4 prefix list
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=7d
+AccuracySec=1h
+
+[Install]
+WantedBy=timers.target

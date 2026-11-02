@@ -1,0 +1,17 @@
+[Unit]
+Description=CN geo firewall web manager (fw-admin)
+Documentation=file:@PREFIX@/fw_admin.py
+After=network-online.target docker.service firewalld.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=FW_ADMIN_CONFIG=@STATE_DIR@/config.json
+Environment=FW_ADMIN_STATE=@STATE_DIR@
+ExecStart=@PYTHON@ @PREFIX@/fw_admin.py serve
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

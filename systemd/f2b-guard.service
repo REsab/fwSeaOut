@@ -1,0 +1,7 @@
+[Unit]
+Description=Guard SIP geo + fail2ban ipsets in DOCKER-USER
+After=docker.service fail2ban.service
+
+[Service]
+Type=oneshot
+ExecStart=@FLOCK@ -n /run/f2b-guard.lock @LIBEXEC_DIR@/f2b-guard.sh

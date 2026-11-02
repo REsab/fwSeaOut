@@ -1,0 +1,32 @@
+{
+  "mode": "disabled",
+  "last_mode": "monitor",
+  "web_bind": "0.0.0.0",
+  "web_port": 4443,
+  "admin_ips": [
+    "203.0.113.10"
+  ],
+  "cn_allowed_range": [2000, 50000],
+  "always_allow_nets": [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "127.0.0.0/8",
+    "100.64.0.0/10"
+  ],
+  "rtp_udp_ranges": [],
+  "cn_ipset": "cn_ip",
+  "allow_ipset": "f2b_allow",
+  "guard_chain": "CN_GUARD",
+  "verdict_chain": "CN_VERDICT",
+  "rollback_seconds": 120,
+  "log_accepted": true,
+  "armed_until": 0,
+  "password_salt": "",
+  "password_hash": "",
+  "session_secret": "",
+  "cn_sources": [
+    "https://www.ipdeny.com/ipblocks/data/countries/cn.zone",
+    "https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt"
+  ]
+}

@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python syntax
+        run: python3 -m py_compile fw_admin.py
+      - name: Shell syntax
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          for f in scripts/*.sh; do sh -n "$f"; done
+      - name: Installer dry-run
+        run: ./install.sh --dry-run --non-interactive --admin-ip 203.0.113.10
+      - name: Config example is valid JSON
+        run: python3 -m json.tool config/config.example.json > /dev/null

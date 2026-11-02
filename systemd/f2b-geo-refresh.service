@@ -1,0 +1,6 @@
+[Unit]
+Description=Refresh China IPv4 prefix list for geo filter
+
+[Service]
+Type=oneshot
+ExecStart=@LIBEXEC_DIR@/f2b-geo-refresh.sh
