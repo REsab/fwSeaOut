@@ -21,6 +21,7 @@
 #   fw_admin.py revert           把 mode 降到 monitor 并 apply（自动回滚用）
 #   fw_admin.py disable          把 mode 设为 disabled 并 apply（摘掉所有挂载）
 #   fw_admin.py reload-cn        从 CN 源刷新 cn_ip（*_new + swap，绝不 flush）
+#   fw_admin.py geo <ip>...      查询 IP 地区并写入缓存（页面展示用）
 #   fw_admin.py watchdog <epoch> 内部：到点未确认则 revert
 #   fw_admin.py set-password     交互式设置后台密码
 import json
@@ -33,14 +34,16 @@ import secrets
 import subprocess
 import threading
 import ipaddress
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, quote
 import html as htmllib
 
 CONFIG_PATH = os.environ.get("FW_ADMIN_CONFIG", "/etc/fw-admin/config.json")
 STATE_DIR = os.environ.get("FW_ADMIN_STATE", "/etc/fw-admin")
 CONFIRM_FILE = os.path.join(STATE_DIR, "confirmed")
 LOG_FILE = os.path.join(STATE_DIR, "fw_admin.log")
+GEO_CACHE_FILE = os.path.join(STATE_DIR, "ipgeo.json")
 
 DRY = False
 DRY_LOG = []
@@ -69,6 +72,9 @@ DEFAULT_CONFIG = {
     "verdict_chain": "CN_VERDICT",
     "rollback_seconds": 120,
     "log_accepted": True,              # 记录国内 IP 在管理范围内的新建访问（访问记录），带限速
+    "geo_enabled": True,               # 用公开接口查询命中 IP 的地区并落盘缓存
+    "geo_api": "http://ip-api.com/batch?lang=zh-CN&fields=status,country,regionName,city,isp,query",
+    "geo_max_per_cycle": 100,          # 每轮最多查询多少个新 IP（接口限速保护）
     "armed_until": 0,
     "password_salt": "",
     "password_hash": "",
@@ -431,6 +437,12 @@ def read_logs(kind="drop", limit=300, since="-24h"):
             continue
         ts = line[:19].replace("T", " ")
         rec = {"time": ts}
+        if "CNGUARD-DROP " in line:
+            rec["kind"] = "drop"
+        elif "CNGUARD-WOULD-DROP " in line:
+            rec["kind"] = "would"
+        elif "CNGUARD-ACC " in line:
+            rec["kind"] = "acc"
         for tok in line.split():
             if "=" not in tok:
                 continue
@@ -448,6 +460,206 @@ def read_logs(kind="drop", limit=300, since="-24h"):
         if rec.get("src"):
             rows.append(rec)
     return rows[-limit:], ""
+
+
+# ----------------------------- IP 地区 -----------------------------
+# 命中/拉黑的 IP 由后台线程调用公开接口（ip-api.com 批量，失败回落 ipwho.is）查询一次，
+# 结果落盘到 STATE_DIR/ipgeo.json。渲染路径只读缓存，绝不阻塞页面或请求外网。
+
+GEO_API_FALLBACK = "https://ipwho.is/%s?lang=zh-CN"
+GEO_TTL_OK = 30 * 86400        # 查询成功缓存 30 天
+GEO_TTL_FAIL = 1800            # 失败按 30min 起指数退避，最长 24h
+GEO_MIN_GAP = 4.5              # ip-api 批量接口限 15 次/分，两批之间至少间隔
+GEO_MAX_CACHE = 5000
+
+GEO_LOCK = threading.Lock()
+GEO_INFLIGHT = set()
+GEO_LAST_CALL = [0.0]
+GEO_LAST_KICK = [0.0]
+
+
+def load_geo_cache():
+    try:
+        with open(GEO_CACHE_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        log("地区缓存读取失败，忽略: %r" % e)
+        return {}
+
+
+def save_geo_cache(cache):
+    now = int(time.time())
+    keep = {ip: r for ip, r in cache.items()
+            if isinstance(r, dict) and now - int(r.get("ts", 0)) < 90 * 86400}
+    if len(keep) > GEO_MAX_CACHE:
+        keep = dict(sorted(keep.items(), key=lambda kv: int(kv[1].get("ts", 0)),
+                           reverse=True)[:GEO_MAX_CACHE])
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = GEO_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(keep, f, ensure_ascii=False, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, GEO_CACHE_FILE)
+    except Exception as e:
+        log("地区缓存写入失败: %r" % e)
+
+
+def geo_label(rec):
+    """把缓存记录拼成『国家 · 省州 · 城市』；查询失败/无记录返回空串。"""
+    if not rec or rec.get("fail"):
+        return ""
+    parts = []
+    for k in ("country", "region", "city"):
+        v = (rec.get(k) or "").strip()
+        if v and v not in parts:
+            parts.append(v)
+    return " · ".join(parts)
+
+
+def _geo_http_json(url, payload=None, timeout=10):
+    req = urllib.request.Request(url, data=payload, headers={
+        "User-Agent": "fw-admin/1.0", "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _geo_rec(item):
+    return {"country": (item.get("country") or "").strip(),
+            "region": (item.get("regionName") or item.get("region") or "").strip(),
+            "city": (item.get("city") or "").strip(),
+            "isp": (item.get("isp") or "").strip(),
+            "ts": int(time.time()), "fail": 0}
+
+
+def geo_lookup(ips, cfg):
+    """批量查询地区，返回 {ip: rec}；接口失败时回落 HTTPS 单查（最多 5 个）。"""
+    out = {}
+    while True:
+        with GEO_LOCK:
+            gap = time.time() - GEO_LAST_CALL[0]
+            if gap >= GEO_MIN_GAP:
+                GEO_LAST_CALL[0] = time.time()
+                break
+        time.sleep(GEO_MIN_GAP - gap)
+    t0 = time.time()
+    try:
+        url = cfg.get("geo_api") or DEFAULT_CONFIG["geo_api"]
+        data = _geo_http_json(url, json.dumps([{"query": ip} for ip in ips]).encode(), timeout=25)
+        if not isinstance(data, list):
+            raise ValueError("unexpected response")
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            ip = (item.get("query") or "").strip()
+            if not ip:
+                continue
+            out[ip] = _geo_rec(item) if item.get("status") == "success" else {
+                "ts": int(time.time()), "fail": 1}
+        return out
+    except Exception as e:
+        log("地区查询失败（批量接口，%d 个 IP，%.1fs）: %r" % (len(ips), time.time() - t0, e))
+    for ip in ips[:5]:
+        try:
+            time.sleep(1)
+            data = _geo_http_json(GEO_API_FALLBACK % quote(ip), timeout=10)
+            out[ip] = _geo_rec(data) if data.get("success") else {
+                "ts": int(time.time()), "fail": 1}
+        except Exception as e:
+            log("地区查询失败（%s）: %r" % (ip, e))
+    return out
+
+
+def _geo_needs(rec, now):
+    if not rec:
+        return True
+    if int(rec.get("ts", 0)) > now:
+        return False
+    if rec.get("fail"):
+        ttl = min(86400, GEO_TTL_FAIL * (2 ** min(int(rec.get("fail", 1)), 5)))
+    else:
+        ttl = GEO_TTL_OK
+    return now - int(rec.get("ts", 0)) > ttl
+
+
+def geo_enrich(ips, cfg=None):
+    """补齐一批 IP 的地区缓存；已缓存/正在查询/已关闭的跳过。返回新查询到的个数。"""
+    cfg = cfg or load_config()
+    if not cfg.get("geo_enabled", True):
+        return 0
+    now = int(time.time())
+    with GEO_LOCK:
+        cache = load_geo_cache()
+        todo = []
+        for ip in dict.fromkeys(str(x) for x in ips if x):
+            if ip in GEO_INFLIGHT or not _geo_needs(cache.get(ip), now):
+                continue
+            todo.append(ip)
+        todo = todo[:max(1, int(cfg.get("geo_max_per_cycle", 100) or 100))]
+        GEO_INFLIGHT.update(todo)
+    if not todo:
+        return 0
+    try:
+        got = geo_lookup(todo, cfg)
+        with GEO_LOCK:
+            cache = load_geo_cache()
+            changed = False
+            for ip in todo:
+                rec = got.get(ip)
+                # 批量超时后只有兜底的少量 IP 真正查过；未尝试的保持原样，下一轮再查
+                if not rec:
+                    continue
+                if rec.get("fail"):
+                    rec["fail"] = min(int((cache.get(ip) or {}).get("fail", 0)) + 1, 6)
+                    rec["ts"] = now
+                cache[ip] = rec
+                changed = True
+            if changed:
+                save_geo_cache(cache)
+        return len(got)
+    finally:
+        with GEO_LOCK:
+            GEO_INFLIGHT.difference_update(todo)
+
+
+def geo_kick(ips):
+    """渲染时发现未缓存 IP 就丢给后台补齐（20s 节流，不阻塞响应）。"""
+    now = time.time()
+    with GEO_LOCK:
+        if now - GEO_LAST_KICK[0] < 20:
+            return
+        GEO_LAST_KICK[0] = now
+        pending = [ip for ip in set(ips) if ip not in GEO_INFLIGHT]
+    if pending:
+        threading.Thread(target=geo_enrich, args=(pending,), daemon=True).start()
+
+
+def geo_loop():
+    """每 60s 扫描近 24h 命中日志，把新出现的来源 IP 地区补进缓存（拉黑即记录）。"""
+    while True:
+        try:
+            cfg = load_config()
+            if cfg.get("geo_enabled", True):
+                rows, _ = read_logs("all", limit=20000, since="-24h")
+                last, blocked = {}, set()
+                for i, r in enumerate(rows):
+                    ip = r.get("src")
+                    if not ip:
+                        continue
+                    last[ip] = i
+                    if r.get("kind") in ("drop", "would"):
+                        blocked.add(ip)
+                # 拉黑/将拦的来源优先，其次按最近出现时间
+                ips = sorted(last, key=lambda ip: (ip in blocked, last[ip]), reverse=True)
+                n = geo_enrich(ips, cfg)
+                if n:
+                    log("地区缓存已更新 %d 个 IP" % n)
+        except Exception as e:
+            log("geo 线程异常: %r" % e)
+        time.sleep(60)
 
 
 def hash_password(pw, salt):
@@ -499,6 +711,9 @@ table{border-collapse:collapse;width:100%}
 td,th{border:1px solid var(--line);padding:7px 8px;font-size:13.5px;text-align:left;vertical-align:top;word-break:break-word}
 th{background:rgba(148,163,184,.08);white-space:nowrap}
 .table-wrap{width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:8px}
+.table-wrap td code{white-space:nowrap}
+.nw{white-space:nowrap}
+.geo{display:inline-block;min-width:132px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .row>input,.row>select{flex:1 1 160px}
 .row>.num{flex:0 0 110px}
@@ -531,7 +746,7 @@ border-radius:999px;padding:5px 10px;white-space:nowrap}
   .row>input,.row>select,.row>button{flex:1 1 100%}
   .row>.num{flex:1 1 38%}
   td,th{font-size:12.5px;padding:6px 7px}
-  table.wide{min-width:560px}
+  table.wide{min-width:640px}
   .stats{grid-template-columns:1fr 1fr}
   .stats .stat:last-child:nth-child(odd){grid-column:1/-1}
   button.block{width:100%}
@@ -759,6 +974,10 @@ class Handler(BaseHTTPRequestHandler):
             if cfg["mode"] != "disabled":
                 apply(cfg)
             msg = "访问记录（CNGUARD-ACC）已%s" % ("开启" if cfg["log_accepted"] else "关闭")
+        elif act == "toggle_geo":
+            cfg["geo_enabled"] = not cfg.get("geo_enabled", True)
+            save_config(cfg)
+            msg = "IP 地区查询已%s（已缓存地区不受影响）" % ("开启" if cfg["geo_enabled"] else "关闭")
         elif act == "toggle_power":
             if cfg["mode"] == "disabled":
                 new = cfg.get("last_mode", "monitor")
@@ -830,15 +1049,41 @@ class Handler(BaseHTTPRequestHandler):
         # 统计各来源 IP 命中次数（Top）
         from collections import Counter
         cnt = Counter(r.get("src", "?") for r in rows)
-        top = "".join("<tr><td><code>%s</code></td><td>%d</td></tr>" %
-                      (htmllib.escape(s), n) for s, n in cnt.most_common(15))
+        # 地区：只读本地缓存（拉黑时后台线程已落盘），未命中的丢给后台补查
+        geo_on = cfg.get("geo_enabled", True)
+        gcache = load_geo_cache()
+        missing = [ip for ip in cnt if not geo_label(gcache.get(ip))]
+        if geo_on and missing:
+            geo_kick(missing)
+
+        def region_html(ip):
+            label = geo_label(gcache.get(ip))
+            if label:
+                return '<span class="geo">%s</span>' % htmllib.escape(label)
+            if not geo_on:
+                return '<span class="small">已关闭</span>'
+            return '<span class="small">查询中…</span>'
+
+        top = "".join("<tr><td><code>%s</code></td><td>%s</td><td>%d</td></tr>" %
+                      (htmllib.escape(s), region_html(s), n) for s, n in cnt.most_common(15))
         # 明细倒序（最新在上）
         detail = "".join(
-            "<tr><td>%s</td><td><code>%s</code></td><td>%s:%s</td><td>%s &rarr; %s</td></tr>" %
+            "<tr><td class=\"nw\">%s</td><td><code>%s</code></td><td>%s</td><td class=\"nw\">%s:%s</td><td class=\"nw\">%s &rarr; %s</td></tr>" %
             (htmllib.escape(r.get("time", "")), htmllib.escape(r.get("src", "")),
+             region_html(r.get("src", "")),
              htmllib.escape(r.get("proto", "").upper()), htmllib.escape(r.get("dpt", "")),
              htmllib.escape(r.get("sport", "")), htmllib.escape(r.get("dst", "")))
             for r in reversed(rows[-200:]))
+        # 地区分布（次数按命中计，IP 数按去重计）
+        regions = {}
+        for ip, n in cnt.items():
+            label = geo_label(gcache.get(ip)) or ("待查询" if geo_on else "未启用地区查询")
+            r = regions.setdefault(label, [0, 0])
+            r[0] += 1
+            r[1] += n
+        region_rows = "".join("<tr><td>%s</td><td>%d</td><td>%d</td></tr>" %
+                              (htmllib.escape(k), v[0], v[1])
+                              for k, v in sorted(regions.items(), key=lambda kv: (-kv[1][1], kv[0]))[:12])
         err_html = '<p class="err">%s</p>' % htmllib.escape(err) if err else ""
         empty = '<p class="small">该类型近 24h 无记录（日志来自内核 journalctl -k，仅在有命中时产生）。</p>' if not rows and not err else ""
         body = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">%s<style>%s</style></head><body><div class="wrap">
@@ -847,12 +1092,17 @@ class Handler(BaseHTTPRequestHandler):
 <div class="row">%s</div>
 %s%s
 <div class="card"><h2>来源 IP Top <span class="small">共 %d 条命中</span></h2>
-<div class="table-wrap"><table><tr><th>来源 IP</th><th>次数</th></tr>%s</table></div></div>
+<div class="table-wrap"><table><tr><th>来源 IP</th><th>地区</th><th>次数</th></tr>%s</table></div>
+<p class="small">地区在 IP 首次命中时由公开接口查询并缓存到 <code>%s</code>，之后直接读缓存，不重复外发。</p></div>
+<div class="card"><h2>来源地区分布</h2>
+<div class="table-wrap"><table><tr><th>地区</th><th>IP 数</th><th>命中次数</th></tr>%s</table></div></div>
 <div class="card"><h2>明细 <span class="small">最新 %d 条</span></h2>
-<div class="table-wrap"><table class="wide"><tr><th>时间</th><th>来源 IP</th><th>协议:目的端口</th><th>源端口 &rarr; 目的</th></tr>%s</table></div></div>
+<div class="table-wrap"><table class="wide"><tr><th>时间</th><th>来源 IP</th><th>地区</th><th>协议:目的端口</th><th>源端口 &rarr; 目的</th></tr>%s</table></div></div>
 </div>%s</body></html>""" % (HEAD_META, PAGE_CSS, nav_html(20, "logs"), tab_html, err_html, empty,
-                            len(rows), top or "<tr><td colspan=2 class=small>无</td></tr>",
-                            min(200, len(rows)), detail or "<tr><td colspan=4 class=small>无</td></tr>",
+                            len(rows), top or "<tr><td colspan=3 class=small>无</td></tr>",
+                            htmllib.escape(GEO_CACHE_FILE),
+                            region_rows or "<tr><td colspan=3 class=small>无</td></tr>",
+                            min(200, len(rows)), detail or "<tr><td colspan=5 class=small>无</td></tr>",
                             AUTO_REFRESH_JS)
         self.send(200, body)
 
@@ -991,7 +1241,15 @@ class Handler(BaseHTTPRequestHandler):
             ", ".join("%d-%d/udp" % (a, b) for a, b in cfg["rtp_udp_ranges"]),
             ROLLBACK_JS, AUTO_REFRESH_JS,
         )
+        geo_card = (
+            '<div class="card"><form method="post" action="/action">'
+            '<input type="hidden" name="action" value="toggle_geo">'
+            '<button type="submit" class="grey block">IP 地区查询：当前%s，点击切换</button>'
+            '<p class="small" style="margin:8px 0 0">命中/拉黑 IP 的地区由公开接口查询一次，'
+            '缓存到 <code>%s</code>；关闭后不再外发查询，记录页仍显示已缓存结果。</p></form></div>'
+        ) % ("开启" if cfg.get("geo_enabled", True) else "关闭", htmllib.escape(GEO_CACHE_FILE))
         body = body.replace("<h2>运行模式</h2>", power_html + "<h2>运行模式</h2>")
+        body = body.replace("<h2>数据源</h2>", geo_card + "<h2>数据源</h2>")
         self.send(200, body)
 
 
@@ -1048,6 +1306,16 @@ def main():
     if cmd == "set-password":
         set_password(cfg)
         return
+    if cmd == "geo":
+        ips = args[1:]
+        if not ips:
+            print("用法: fw_admin.py geo <ip> [ip...]")
+            return
+        geo_enrich(ips, cfg)
+        cache = load_geo_cache()
+        for ip in ips:
+            print("%-16s %s" % (ip, geo_label(cache.get(ip)) or "未知/查询失败"))
+        return
     if cmd == "serve":
         if not cfg.get("session_secret"):
             cfg["session_secret"] = secrets.token_hex(32)
@@ -1057,6 +1325,7 @@ def main():
         if cfg["mode"] == "enforce" and cfg.get("armed_until", 0) > int(time.time()) and not os.path.exists(CONFIRM_FILE):
             arm_rollback(cfg)
         threading.Thread(target=healer_loop, daemon=True).start()
+        threading.Thread(target=geo_loop, daemon=True).start()
         srv = ThreadingHTTPServer((cfg["web_bind"], int(cfg["web_port"])), Handler)
         log("Web 管理后台启动: http://%s:%d (仅白名单+localhost)" % (cfg["web_bind"], cfg["web_port"]))
         try:

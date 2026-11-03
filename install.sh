@@ -285,6 +285,9 @@ cfg.setdefault("armed_until", 0)
 cfg.setdefault("guard_chain", "CN_GUARD")
 cfg.setdefault("verdict_chain", "CN_VERDICT")
 cfg.setdefault("log_accepted", True)
+cfg.setdefault("geo_enabled", True)
+cfg.setdefault("geo_api", "http://ip-api.com/batch?lang=zh-CN&fields=status,country,regionName,city,isp,query")
+cfg.setdefault("geo_max_per_cycle", 100)
 cfg.setdefault("cn_sources", [
     "https://www.ipdeny.com/ipblocks/data/countries/cn.zone",
     "https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt",

@@ -33,6 +33,7 @@
 | 白名单 | 管理 IP 全端口放行；`f2b_allow` ipset 与私网/关键源恒放行 |
 | 媒体豁免 | RTP/UDP 段可配置为永不按来源 IP 过滤 |
 | 日志查看 | 从 `journalctl -k` 解析访问 / 将拦 / 已拦三类记录，页面按来源 IP 聚合 Top |
+| IP 地区 | 首次命中/拉黑时用公开接口查询地区并落盘缓存，记录页显示地区列与地区分布；渲染时不外发请求 |
 | 手机适配 | 响应式 Web 管理页，自动刷新倒计时在填写表单时暂停 |
 | 零第三方依赖 | 只有 Python 标准库 + `iptables`/`ipset` |
 
@@ -160,7 +161,7 @@ sudo ./install.sh --admin-ip 203.0.113.10 --non-interactive
 访问 `http://<服务器IP>:4443`，仅 `admin_ips` 与服务器 localhost 可访问。
 
 - 仪表盘：模式、来源 IP、CN 允许范围、回滚倒计时、开关、模式切换、白名单、端口范围
-- 记录：拉黑 / 将拦 / 访问 / 全部，近 24 小时，按来源 IP 聚合 Top
+- 记录：拉黑 / 将拦 / 访问 / 全部，近 24 小时，按来源 IP 聚合 Top，并显示 IP 地区与地区分布
 - 规则：dry-run 打印当前配置将要执行的完整 `iptables` 命令
 - 备份：导出当前 `iptables-save`
 - 自动刷新：30/20 秒倒计时；输入框聚焦或有未提交改动时暂停，避免打断操作
@@ -193,7 +194,12 @@ ssh -L 4443:127.0.0.1:4443 root@<服务器IP>
 | `guard_chain` / `verdict_chain` | 链名，默认 `CN_GUARD` / `CN_VERDICT` |
 | `rollback_seconds` | enforce 自动回滚窗口 |
 | `log_accepted` | 是否记录国内 IP 命中（`CNGUARD-ACC`） |
+| `geo_enabled` | 是否调用公开接口查询命中 IP 的地区（默认开启） |
+| `geo_api` | 批量查询接口，默认 `ip-api.com/batch`（失败自动回落 `ipwho.is`） |
+| `geo_max_per_cycle` | 每轮最多查询的新 IP 数，默认 100（接口限速保护） |
 | `cn_sources` | CN 前缀下载源 |
+
+地区缓存独立落盘在 `/etc/fw-admin/ipgeo.json`（`0600`，成功结果保留 30 天，失败按指数退避重试）。只有源 IP 会发给第三方接口，不发送端口、目的地址或任何配置；不想要可关闭 `geo_enabled` 或点页面上的「IP 地区查询」开关。
 
 修改配置后重启服务生效：
 
@@ -215,6 +221,7 @@ python3 /opt/fw-admin/fw_admin.py <command>
 | `revert` | 降为 `monitor` 并应用（回滚用） |
 | `disable` | 设为 `disabled` 并摘除挂载 |
 | `reload-cn` | 重新下载并原子替换 `cn_ip` |
+| `geo <ip>...` | 查询 IP 地区并写入缓存 |
 | `set-password` | 交互式改密码 |
 | `watchdog <epoch>` | 内部使用：到点未确认则回滚 |
 

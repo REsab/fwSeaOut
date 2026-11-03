@@ -10,6 +10,7 @@
 | 配置 | `/etc/fw-admin/config.json` | 模式、端口范围、白名单、密码哈希 |
 | 确认标记 | `/etc/fw-admin/confirmed` | 存在即代表 enforce 已固化 |
 | 程序日志 | `/etc/fw-admin/fw_admin.log` | apply / 回滚 / 刷新等事件 |
+| 地区缓存 | `/etc/fw-admin/ipgeo.json` | IP → 国家/省州/城市，首次命中时写入 |
 | CN 名单 | `/etc/f2b/cn-v4.list` | 中国 IPv4 前缀 |
 | 恒放行名单 | `/etc/f2b/allow-v4.list` | 不做地域判定的来源 |
 | 脚本参数 | `/etc/f2b-geo/env` | 三个 shell 脚本共用 |
@@ -102,6 +103,29 @@ tail -f /etc/fw-admin/fw_admin.log
 journalctl -u fw-admin -f
 ```
 
+### 4.1 IP 地区缓存
+
+`geo_loop` 每 60 秒扫描近 24h 的 `CNGUARD-*` 日志，把新出现的来源 IP 批量提交给公开接口
+（默认 `ip-api.com/batch`，失败回落 `ipwho.is`），结果写入 `/etc/fw-admin/ipgeo.json`。
+页面渲染只读缓存，不会因为打开记录页而阻塞或向外发请求。
+
+```bash
+# 手动查询并写入缓存
+sudo $FW geo 8.8.8.8 1.1.1.1
+# 查看缓存
+sudo python3 -m json.tool /etc/fw-admin/ipgeo.json | head -40
+# 关闭外发查询（已有缓存继续展示）
+sudo python3 - <<'PY'
+import json; p="/etc/fw-admin/config.json"; c=json.load(open(p)); c["geo_enabled"]=False
+json.dump(c, open(p,"w"), indent=2, ensure_ascii=False)
+PY
+sudo systemctl restart fw-admin
+```
+
+成功结果保留 30 天；失败按 30 分钟起指数退避，最长 24 小时重试。服务器无外网时页面显示
+“查询中…”，不影响拦截与记录。若更换了 `geo_api`（例如内网自建 GeoIP 服务），返回体需兼容
+`status=success` + `country/regionName/city` 字段；否则请关闭该功能。
+
 ## 5. 日常操作
 
 ### 5.1 模式
@@ -184,6 +208,7 @@ systemctl restart fw-admin
 | enforce 被自动降级 | `fw_admin.log` 里找 `healer 防呆` | 补 CN 名单后再评估 |
 | 日志为空 | `journalctl -k` 是否有内核日志权限；是否真的命中 | 用 `monitor` 观察；检查 rsyslog 是否吞了 kern |
 | 服务起不来 | `journalctl -u fw-admin -n 50` | 常见为 `iptables`/`ipset` 不存在、JSON 损坏 |
+| 地区一直“查询中” | `fw_admin.log` 是否有“地区查询失败”；`curl ip-api.com` 是否可达 | 恢复出网；或关 `geo_enabled` 不再外发 |
 | 端口范围改错 | `config.json` 的 `cn_allowed_range` | Web 改回或 CLI 修 JSON 后 `apply` |
 
 ## 8. 已知坑清单
